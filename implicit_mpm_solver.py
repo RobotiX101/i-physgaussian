@@ -364,9 +364,10 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
             v_max = min(50.0, 0.4 * self.mpm_model.grid_lim / dt)
             grid_v_capped = np.clip(grid_v_cur, -v_max, v_max)
+            # Updated Lagrangian: x moves with v^k (NOT frozen at x^n)
+            # This matches the original PhysGaussian baseline which diverges at large dt
             self._update_x_F(grid_v_capped, dt, apply_bc=True)
-            wp.copy(self.mpm_state.particle_x, self._buf_x)
-            wp.synchronize_device(self.device)
+            # Do NOT restore x^n — Updated Lagrangian keeps x = x^n + dt*v^k
 
             wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
                       inputs=[self.mpm_state, self.mpm_model, dt], device=device)
@@ -388,6 +389,12 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
             diff = grid_v_new - grid_v_cur
             residual = float(np.sqrt(np.nansum(diff ** 2)))
+
+            # Divergence detection: if residual explodes, bail out immediately
+            if not np.isfinite(residual) or residual > 1e8:
+                if step == 0:
+                    print(f"  [Picard-Vanilla] DIVERGED at iter {it}, res={residual:.3e}", flush=True)
+                break
 
             if residual < self.implicit_tolerance:
                 converged = True
@@ -528,34 +535,11 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         v_n_particles = self.mpm_state.particle_v.numpy()  # shape [N, 3]
 
         if self._prev_particle_v is not None and self._prev_dt is not None:
-            # Estimate grid-level a^n from particle velocity change
-            # a^n_p = (v^n_p - v^{n-1}_p) / dt_prev
-            a_n_particles = (v_n_particles - self._prev_particle_v) / self._prev_dt
+            # Newmark predictor: v^(0) = v_explicit + dt*(1-gamma)*a^n
+            # gamma=1/2 (Newmark constant-acceleration)
+            gamma_nm = 0.5
 
-            # Build Newmark predictor initial grid velocity via P2G of a^n
-            # v_I^(0) = v_I^n_explicit + dt*(1-gamma)*a_I^n
-            # gamma=1/2 => (1-gamma)=0.5
-            # We need a^n on the grid: first do explicit P2G to get v_I^n,
-            # then add dt*0.5*a_I^n (which we approximate via particle->grid scatter)
-            gamma_nm = 0.5  # Newmark gamma
-
-            # Write a^n to particle_v temporarily for P2G
-            a_n_wp = wp.array(a_n_particles.astype('float32'), dtype=wp.vec3, device=device)
-            wp.copy(self.mpm_state.particle_v, a_n_wp)
-
-            # P2G of a^n to get a_I^n on grid
-            wp.launch(kernel=mpm.zero_grid, dim=grid_size,
-                      inputs=[self.mpm_state, self.mpm_model], device=device)
-            wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
-                      inputs=[self.mpm_state, self.mpm_model, dt], device=device)
-            a_grid = self._grid_velocity_from_p2g(0.0)  # dt=0 => just v_in/m (no gravity)
-
-            # Restore v^n to particle_v
-            v_n_wp = wp.array(v_n_particles.astype('float32'), dtype=wp.vec3, device=device)
-            wp.copy(self.mpm_state.particle_v, v_n_wp)
-            wp.synchronize_device(device)
-
-            # Now do standard explicit P2G to get v_I^n_explicit
+            # Standard explicit P2G — no side effects on particle_v
             wp.launch(kernel=mpm.zero_grid, dim=grid_size,
                       inputs=[self.mpm_state, self.mpm_model], device=device)
             wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
@@ -563,6 +547,14 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
                       inputs=[self.mpm_state, self.mpm_model, dt], device=device)
             v_explicit = self._grid_velocity_from_p2g(dt)
+
+            # Estimate grid-level a^n from consecutive explicit velocities
+            # Avoids corrupting particle_v with temporary writes
+            if hasattr(self, '_prev_grid_v_explicit') and self._prev_grid_v_explicit is not None:
+                a_grid = (v_explicit - self._prev_grid_v_explicit) / self._prev_dt
+            else:
+                a_grid = np.zeros_like(v_explicit)
+            self._prev_grid_v_explicit = v_explicit.copy()
 
             # Newmark predictor: v_I^(0) = v_explicit + dt*(1-gamma)*a_I^n
             v_k = v_explicit + dt * (1.0 - gamma_nm) * a_grid
@@ -622,13 +614,14 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
                 break
 
             # Stagnation check (after min_newton_iters)
+            # contraction = res_norm / prev_res_norm: <1 means converging, ~1 means stagnating
             if newton_it >= min_newton_iters and prev_res_norm is not None:
                 if prev_res_norm > 1e-14:
-                    reduction = prev_res_norm / res_norm
-                    # Exit if contraction < 0.95 (stagnating)
-                    if reduction < 0.95:
+                    contraction = res_norm / prev_res_norm
+                    # Exit if contraction > 0.95 (less than 5% reduction per iter)
+                    if contraction > 0.95:
                         if step == 0:
-                            print(f"  [Newton] stagnation at iter {newton_it}, reduction={reduction:.3f}", flush=True)
+                            print(f"  [Newton] stagnation at iter {newton_it}, contraction={contraction:.3f}", flush=True)
                         break
             final_residual = res_norm
 
@@ -683,7 +676,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             delta_flat, info = sp_gmres(A, -r_k.ravel().astype(np.float64),
                                         M=M_prec,
                                         restart=self.gmres_max_iters,
-                                        maxiter=1,
+                                        maxiter=3,  # allow 3 restart cycles for large k
                                         rtol=float(eta_k))
             delta_v = delta_flat.reshape(v_k.shape).astype(np.float32)
 
