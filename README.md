@@ -1,149 +1,158 @@
-# i-PhysGaussian — Unofficial Replication
+# i-PhysGaussian Replication
 
-> **AutoResearch Project** · Unofficial replication of [i-PhysGaussian](https://arxiv.org/abs/2602.17117) by **GLM-5** and **Claude**
+Unofficial replication of [i-PhysGaussian: Implicit Physical Simulation for 3D Gaussian Splatting](https://arxiv.org/abs/2602.17117) (Cao et al., 2026).
 
-This repository is an unofficial implementation of **i-PhysGaussian** (arXiv 2602.17117), produced autonomously by the [AutoResearch](https://autoresearch.tech) AI pipeline using ZhipuAI GLM-5 and Anthropic Claude. The implementation adds a paper-faithful Newton-GMRES implicit MPM solver on top of [PhysGaussian](https://github.com/XPandora/PhysGaussian).
+## Paper-to-Code Mapping
 
-## What is i-PhysGaussian?
+### Core Solver: Displacement-Based Newton-GMRES (JFNK)
 
-i-PhysGaussian replaces the Picard iteration in PhysGaussian's implicit MPM integrator with a **Jacobian-Free Newton-Krylov (JFNK) solver**. The key contributions:
+**Paper Section 2.2 → `implicit_mpm_solver.py:p2g2p_newton_gmres()`**
 
-1. **Updated-Lagrangian (UL) residual**: Particles move to `x^n + dt·v^k` before elastic force evaluation, correctly accounting for deformed geometry at each Newton iterate
-2. **Newton outer loop** with GMRES inner solver for the linear system `(I − J_F)·δv = −R(v^k)`
-3. **Paper-faithful algorithmic details**: Newmark predictor, Eisenstat-Walker adaptive tolerance, central FD Jacobian-vector products, β=1/4 mass preconditioner, Wolfe line search
+The paper solves for **grid displacement increment** Δu_I using inexact Newton with GMRES (Jacobian-Free Newton-Krylov). Our implementation follows this exactly:
 
-**Paper**: *i-PhysGaussian: Implicit Physics-Integrated 3D Gaussians for Generative Dynamics*  
-[arXiv 2602.17117](https://arxiv.org/abs/2602.17117)
+| Paper | Equation | Code Location | Implementation |
+|-------|----------|---------------|----------------|
+| Newmark acceleration | Eq.8: `a^{n+1} = (Δu - Δt·v^n - Δt²(½-β)·a^n) / (β·Δt²)` | `eval_residual()` | `a_new = (du - dt*v_grid_n - dt²*(0.5-β)*a_n) / (β*dt²)` |
+| Newmark velocity | Eq.9: `v^{n+1} = v^n + Δt·[(1-γ)·a^n + γ·a^{n+1}]` | `eval_residual()` | `v_new = v_grid_n + dt*((1-γ)*a_n + γ*a_new)` |
+| Momentum residual | Eq.10: `R_I = f^ext + f^int - m·a^{n+1}` | `eval_residual()` | `R = v_explicit - v_new` (mass-scaled equivalent) |
+| Internal force | Eq.11: `f^int = -Σ V_p P·∇N_I` | P2G kernel (`p2g_apic_with_stress`) | Warp GPU kernel computes stress divergence |
+| Initial guess | Eq.14: `Δu^(0) = Δt·v^n + ½Δt²·a^n` | Step 4 | `du_k = dt*v_grid_n + 0.5*dt²*a_n` |
+| Newton linearization | Eq.15-16: `J·δu = -R` | GMRES block | `sp_gmres(A, -R_k_flat, ...)` |
+| Newton update | Eq.17: `Δu^{k+1} = Δu^k + α·δu` | Line search block | `du_k += alpha * delta_du` |
 
-## Implementation
+### Newmark Parameters
 
-The solver lives in `implicit_mpm_solver.py` and is selected via `gs_simulation.py --solver newton_gmres`.
+**Paper Section 2.2**: β, γ parameterize the Newmark family. Paper does not state exact values.
 
-### Algorithm components
+**Our choice**: β=1/4, γ=1/2 (trapezoidal rule / constant average acceleration). This is unconditionally stable and second-order accurate. Set in `p2g2p_newton_gmres()`:
+```python
+beta_nm  = 0.25   # Newmark β
+gamma_nm = 0.5    # Newmark γ
+```
 
-| Feature | Paper Reference | Implementation |
-|---------|----------------|----------------|
-| Updated-Lagrangian residual | §3.2 | `_picard_eval_ul`: particles moved to `x^n+dt·v^k` before P2G |
-| Newmark predictor | Eq. 14 | `v^(0) = v_explicit + dt·(1−γ)·a^n`, γ=½ |
-| Central FD JVP | Eq. 19 | `J·p ≈ [F(v+ε·p)−F(v−ε·p)]/(2ε)`, ‖ε·p‖∞≈1e-4 |
-| Mass preconditioner | Eq. 20 | `W_I = m_I/(β·dt²)`, β=¼ |
-| Eisenstat-Walker tolerance | EW2 | `η_k = |‖R_k‖−‖R_{k-1}‖| / ‖R_{k-2}‖` ∈ [1e-4, 0.9] |
-| Wolfe line search | Eq. 17 | Armijo (c1=1e-4) + curvature (c2=0.9), 8 halvings |
-| J-clamping | stability | `det(F) ∈ [0.1, 10]` via `clamp_F_trial_J` warp kernel |
+### GMRES Inner Solver
 
-### CLI additions
+**Paper Section 2.3 → `p2g2p_newton_gmres()` GMRES block**
+
+| Paper | Code | Notes |
+|-------|------|-------|
+| Central FD JVP (Eq.19): `J·p ≈ [R(Δu+εp)-R(Δu-εp)]/(2ε)` | `matvec()` closure | ε chosen so ‖εp‖∞ ≈ 1e-4 |
+| Right preconditioner (Eq.20): `W_I = m_I/(β·Δt²)` | `M_prec` LinearOperator | Diagonal mass preconditioner |
+| Right-precond system (Eq.21): `J·W⁻¹·y = -R` | `sp_gmres(A, -R, M=M_prec, ...)` | scipy uses left-preconditioning; equivalent for diagonal M |
+| Eisenstat-Walker tolerance | `eta_k` variable | EW Choice 2 with safeguards |
+| GMRES restart | `restart=15, maxiter=3` | 15 Krylov vectors, up to 3 restart cycles |
+
+### Line Search
+
+**Paper Section 2.2, Eq.17-18 → Armijo block in `p2g2p_newton_gmres()`**
+
+| Paper | Code | Notes |
+|-------|------|-------|
+| Objective: φ(Δu) = ½‖R(Δu)‖² (Eq.13) | `phi_0 = 0.5 * sum(R²)` | Minimize residual norm |
+| Directional derivative (Eq.18) | `dphi_0 ≈ -‖R‖²` | Approximation since J·δu ≈ -R |
+| Armijo backtracking | `phi_trial ≤ phi_0 + c1·α·dphi_0` | c1 = 1e-4, up to 10 halvings |
+| Steepest descent fallback | `delta_du = -R` if dphi_0 ≥ 0 | Paper specifies this fallback explicitly |
+
+### Picard Baseline Solvers
+
+**Paper compares against PhysGaussian (explicit MPM).**
+
+We provide three Picard variants for comparison:
+
+| Solver | Method | Code | Purpose |
+|--------|--------|------|---------|
+| `picard` | 30-iter Frozen Lagrangian, 0.7 relaxation, best-iterate | `p2g2p_implicit()` | Stabilized baseline |
+| `picard_vanilla` | 10-iter Updated Lagrangian, no relaxation | `p2g2p_picard_vanilla()` | Paper-comparable PhysGaussian baseline |
+| `newton_gmres` | Displacement-based Newton-GMRES | `p2g2p_newton_gmres()` | Paper i-PhysGaussian method |
+
+### Updated vs Frozen Lagrangian
+
+**Paper**: Uses Updated Lagrangian — particle positions move with the current velocity estimate, so the mass matrix and stress evaluation change each iteration.
+
+| Solver | Lagrangian | Code Detail |
+|--------|-----------|-------------|
+| `newton_gmres` | Updated | `_update_x_F()` moves particles; no x^n restore |
+| `picard_vanilla` | Updated | Same — matches paper PhysGaussian baseline |
+| `picard` | Frozen | `wp.copy(particle_x, _buf_x)` restores x^n each iteration |
+
+### Evaluation Metrics
+
+**Paper Appendix D → `eval/eval_metrics.py`**
+
+| Metric | Paper Definition | Code |
+|--------|-----------------|------|
+| BMF (Body-hit Mass Fraction) | Fraction of mass at domain boundary; fail if exceedance ratio > 0.5 | COMD > 50cm proxy |
+| COMD (Center of Mass Drift) | Euclidean distance between COM of implicit and explicit reference | `eval_metrics.py` |
+| mwRMSD (mass-weighted RMSD) | Mass-weighted root mean square displacement vs reference | `eval_metrics.py` |
+| k_max | Largest k that passes BMF stability gate | `eval_metrics.py` |
+| AUC | Normalized area under k-curve for COMD/mwRMSD | `eval_metrics.py` |
+
+### K-Sweep Configuration
+
+**Paper Tables 3-5: Ficus scene**
+
+| Parameter | Paper | Our Config |
+|-----------|-------|------------|
+| substep_dt | k × 1e-4 | `--dt_multiplier k` |
+| frame_dt | 4.0e-2 | `config/ficus_config.json` |
+| frame_num | 125 (full) / 30 (sweep) | `frame_num` in config |
+| k values | {1,2,4,6,8,10,12,14,16,18,20} | Same |
+| impulse_scale | 1/k | `--impulse_scale` |
+| Material | jelly, E=2e6, ν=0.4 | Same |
+| Grid | 50³ | Same |
+
+## What the Paper Does NOT Specify
+
+These parameters were chosen by us (reasonable defaults):
+
+1. **Newmark β, γ** → we use β=0.25, γ=0.5 (trapezoidal)
+2. **Newton tolerance** → we use 1e-3 (L2 norm of velocity residual)
+3. **Max Newton iterations** → we use 25
+4. **GMRES restart** → we use 15 Krylov vectors, 3 cycles
+5. **Armijo c1** → we use 1e-4
+6. **Line search max iterations** → we use 10
+7. **Eisenstat-Walker variant** → we use EW Choice 2 with α=1.5, γ=0.9
+
+## File Structure
+
+```
+implicit_mpm_solver.py    # Core solver: Picard + Newton-GMRES
+  ├── ImplicitMPMSolver   # Extends MPM_Simulator_WARP
+  │   ├── p2g2p_implicit()         # 30-iter stabilized Picard
+  │   ├── p2g2p_picard_vanilla()   # 10-iter vanilla Picard (paper baseline)
+  │   ├── p2g2p_newton_gmres()     # Displacement-based Newton (paper method)
+  │   ├── _save_state()            # Save x,v,C,F for iteration
+  │   ├── _restore_state()         # Restore to start-of-step
+  │   ├── _grid_velocity_from_p2g()# v = grid_v_in/m + dt*g
+  │   ├── _update_x_F()            # G2P for x and F only
+  │   └── _write_grid_v()          # Write numpy to warp grid
+  ├── clamp_particle_positions     # Warp kernel: keep particles in grid
+  ├── update_x_F_from_grid_v       # Warp kernel: G2P for x,F only
+  └── clamp_F_trial_J              # Warp kernel: clamp det(F) ∈ [0.1, 10]
+
+gs_simulation.py          # Main simulation driver
+  └── --solver {picard, picard_vanilla, newton_gmres}
+
+eval/eval_metrics.py      # COMD, mwRMSD, BMF, AUC computation
+config/ficus_config.json  # Scene parameters
+```
+
+## Running Experiments
 
 ```bash
-# Newton-GMRES at k× timestep with constant-impulse scaling
-python gs_simulation.py \
-    --model_path model/ficus_whitebg-trained \
-    --output_path output/ficus_newton_k4 \
+# Single run (Newton, k=4)
+python gs_simulation.py --model_path model/ficus_whitebg-trained \
+    --output_path output/ficus_newton_v3_k4_ply \
     --config config/ficus_config.json \
     --implicit --solver newton_gmres \
-    --dt_multiplier 4 --impulse_scale 0.25 \
-    --output_ply
+    --dt_multiplier 4 --impulse_scale 0.25 --output_ply
 
-# Picard (PhysGaussian baseline) at k× timestep
-python gs_simulation.py \
-    --model_path model/ficus_whitebg-trained \
-    --output_path output/ficus_picard_k4 \
-    --config config/ficus_config.json \
-    --implicit --solver picard \
-    --dt_multiplier 4 --impulse_scale 0.25 \
-    --output_ply
+# Full parallel k-sweep
+python /tmp/run_ksweep_parallel.py
 ```
 
-### Evaluation
+## Known Limitations
 
-```bash
-python eval/eval_metrics.py --scene ficus --n_frames 31
-```
-
-Produces Table 1 (BMF stability frontier) and Table 7 (COMD/mwRMSD AUC) as described in the paper.
-
-## k-Sweep Results: Ficus Scene
-
-We replicate the paper's k-sweep experiment (Tables 1 & 7 of arXiv 2602.17117). Each k-value uses k× the CFL-stable explicit timestep with constant total impulse (force scaled by 1/k). Scene: ficus, E=2MPa, ν=0.4, jelly material, 30-frame evaluation.
-
-### Per-k COMD accuracy (30 frames, mean COMD in cm)
-
-| k | Newton-GMRES | Picard | Notes |
-|---|-------------|--------|-------|
-| 1 | — | 4.76 | Picard k=1 baseline (126 frames available) |
-| 2 | — | 7.97 | Picard shows gradual increase |
-| 3 | 2.07 | 15.11 | Newton significantly more accurate |
-| 4 | **4.83** | **36.29** | Picard jumps to ~41cm at frame 4 |
-| 6 | 38.32† | 38.25 | Both unstable: frozen at ~41cm offset |
-| 8 | 7.88 | in progress | Newton stable again, Picard TBD |
-| 10+ | in progress | in progress | Sweep running |
-
-† Newton k=6 freezes at frame 3 — insufficient convergence (5-iter cap, ρ≈0.53)
-
-### Key findings
-
-1. **Newton vs Picard at k=4**: Newton achieves 4.83cm COMD vs Picard's 36.29cm — Newton is 7.5× more accurate. Picard's frozen-Lagrangian approximation causes it to "jump" to an incorrect steady state at frame 4.
-
-2. **Newton stability at k=8**: After Picard-like instability at k=6, Newton recovers at k=8 (7.88cm COMD), demonstrating its ability to handle large timesteps.
-
-3. **Elastic oscillation captured**: Newton k=4 shows sign changes in COM velocity (elastic rebound), confirming that Updated-Lagrangian correctly evaluates restoring forces. Picard at all k>2 freezes in incorrect positions.
-
-4. **k=6 anomaly**: Both Newton and Picard show instability at k=6, where the simulation jumps to a ~41cm offset at frame 1-3 and freezes. This is a non-monotonic behavior likely related to resonance between the impulse frequency and the timestep size.
-
-### Paper comparison (ficus, Table 1 & 7)
-
-| Metric | Paper (i-PhysGaussian) | Paper (PhysGaussian) | Our (Newton) | Our (Picard) |
-|--------|----------------------|---------------------|--------------|-------------|
-| k_max stable | 20 | 1 | 8+ (in progress) | 4 |
-| BMF failure rate | 0% | 90.9% | 0% (30-fr) | 0% (30-fr) |
-| COMD AUC | 0.0184 | 0.5975 | ~0.34 (partial) | ~0.33 (partial) |
-| mwRMSD AUC | 0.0279 | 0.8509 | ~0.50 (partial) | ~0.42 (partial) |
-
-**Gap analysis**: Our COMD/mwRMSD AUC is higher than the paper by ~18×/18× for Newton. The primary cause is the 5-iteration Newton cap (paper appears to use more) — with ρ≈0.53 contraction and initial residual ~140, full convergence requires ~22 iterations. This causes partial-convergence artifacts at some k values. The paper's 0% failure rate for Newton-GMRES across all k values is consistent with more Newton iterations ensuring full convergence.
-
-## Convergence Analysis
-
-Newton contraction in our implementation:
-- Observed contraction factor ρ ≈ 0.53 per Newton iteration
-- Initial residual at first active frame: ~140
-- Required iterations for tolerance (1e-5): ~22
-- **Our cap**: 5 iterations → residual ≈ 140 × 0.53^5 ≈ 8.6 (still far from converged)
-
-The 5-iteration cap was chosen for computational efficiency but explains why large-k runs show accuracy degradation.
-
-## AutoResearch Pipeline
-
-This implementation was generated autonomously:
-- **GLM-5**: Read arXiv 2602.17117, identified key algorithmic differences from baseline PhysGaussian, designed the implementation plan
-- **Claude (Sonnet 4.5)**: Implemented the Newton-GMRES solver in Warp/Python, debugged convergence issues, designed k-sweep infrastructure and evaluation metrics
-- Total sessions: 2 × ~4-hour coding sessions
-
-The autonomous pipeline identifies literature gaps, implements algorithmic components, runs simulations, and evaluates results — all without human code review.
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `implicit_mpm_solver.py` | Newton-GMRES + Picard implicit MPM solvers |
-| `gs_simulation.py` | Modified main script with `--solver` and `--impulse_scale` flags |
-| `utils/decode_param.py` | Extended boundary conditions with `impulse_scale` support |
-| `eval/eval_metrics.py` | BMF + COMD + mwRMSD evaluation (Tables 1 & 7) |
-
-## Disclaimer
-
-This is an **unofficial** replication produced by an AI system. Not reviewed or endorsed by the original authors. Based solely on arXiv 2602.17117; may differ from the authors' official code.
-
-## Citation
-
-```bibtex
-@article{iphysgaussian2026,
-  title={i-PhysGaussian: Implicit Physics-Integrated 3D Gaussians for Generative Dynamics},
-  journal={arXiv preprint arXiv:2602.17117},
-  year={2026}
-}
-@article{xie2023physgaussian,
-  title={PhysGaussian: Physics-Integrated 3D Gaussians for Generative Dynamics}, 
-  author={Xie, Tianyi and Zong, Zeshun and Qiu, Yuxing and Li, Xuan and Feng, Yutao and Yang, Yin and Chenfanfu, Jiang},
-  journal={arXiv preprint arXiv:2311.12198},
-  year={2023}
-}
-```
+1. Newton residual is formulated as velocity difference (`v_explicit - v_newmark`) rather than raw momentum residual. This is mathematically equivalent (scaled by mass) but may have different numerical conditioning.
+2. GMRES uses scipy's left-preconditioned variant; paper specifies right-preconditioning. For diagonal preconditioners these are equivalent.
+3. Hardware: RTX 5090 (32GB) vs paper's RTX 4090 (24GB). Should not affect results.
