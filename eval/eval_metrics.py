@@ -69,7 +69,8 @@ def auc_normalised(curve, n_total):
     if len(curve) == 0:
         return 1.0  # worst case for failed runs
     # Pad with worst-case (BMF_THRESH) for missing frames
-    padded = np.concatenate([curve, np.full(n_total - len(curve), BMF_THRESH)])
+    pad_len = max(0, n_total - len(curve))
+    padded = np.concatenate([curve[:n_total], np.full(pad_len, BMF_THRESH)])
     return float(padded.mean() / BMF_THRESH)
 
 
