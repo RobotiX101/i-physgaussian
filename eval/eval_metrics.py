@@ -104,7 +104,7 @@ def run_eval(base_dir, scene="ficus", n_frames=126):
         for k in K_VALUES:
             run_dir = os.path.join(base_dir, dir_template.format(k=k))
             traj = load_trajectory(run_dir, n_frames)
-            if traj is None:
+            if traj is None or len(traj) < 5:
                 results[method_name].append((k, None, None, False))
                 continue
             n = min(len(ref), len(traj))
