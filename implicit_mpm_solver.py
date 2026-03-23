@@ -594,7 +594,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         EW_eta_min = 1e-4
         EW_gamma   = 0.9    # safeguard parameter
         EW_alpha   = 1.5    # choice parameter
-        min_newton_iters = 3  # Minimum iterations before early exit
+        min_newton_iters = 5  # Minimum iterations before early exit
         prev_res_norm = None
         prev_prev_res_norm = None
         eta_k = EW_eta_max  # start loose, tighten as Newton converges
@@ -618,8 +618,8 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             if newton_it >= min_newton_iters and prev_res_norm is not None:
                 if prev_res_norm > 1e-14:
                     contraction = res_norm / prev_res_norm
-                    # Exit if contraction > 0.95 (less than 5% reduction per iter)
-                    if contraction > 0.95:
+                    # Exit if contraction > 0.995 (less than 0.5% reduction per iter)
+                    if contraction > 0.995:
                         if step == 0:
                             print(f"  [Newton] stagnation at iter {newton_it}, contraction={contraction:.3f}", flush=True)
                         break
