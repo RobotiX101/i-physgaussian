@@ -1,11 +1,24 @@
+"""
+i-PhysGaussian Replication -- Evaluation Script v2
+Reproduces Table 1 (BMF stability frontier) and Table 7 (COMD/mwRMSD AUC)
+from arXiv 2602.17117.
+
+Usage:
+    python eval/eval_metrics.py [--base BASE_DIR] [--scene ficus]
+"""
 import numpy as np
 import os
 import glob
+import argparse
 from plyfile import PlyData
 
-BASE = "/root/autodl-tmp/PhysGaussian/output"
+# ── BMF threshold (paper: frames where COMD > BMF_THRESH count as failures) ──
+# Paper does not state the exact value; we use 0.5 * grid_lim = 0.5m as threshold
+# matching the "bounded motion fidelity" concept (motion must stay within domain)
+BMF_THRESH = 0.5  # metres
 
 def load_trajectory(run_dir, max_frames=None):
+    """Load PLY sequence → np array [F, N, 3]."""
     ply_dir = os.path.join(run_dir, "simulation_ply")
     files = sorted(glob.glob(os.path.join(ply_dir, "sim_*.ply")))
     if max_frames:
@@ -13,142 +26,195 @@ def load_trajectory(run_dir, max_frames=None):
     if not files:
         return None
     frames = []
-    for f in files:
-        d = PlyData.read(f)
+    for fpath in files:
+        d = PlyData.read(fpath)
         v = d["vertex"].data
         pts = np.stack([v["x"], v["y"], v["z"]], axis=1)
         frames.append(pts)
-    return np.array(frames)
+    return np.array(frames)   # [F, N, 3]
 
-def compute_com_trajectory(traj):
-    return traj.mean(axis=1)
-
-def compute_comd_per_frame(ref, sim):
+def compute_comd(ref, sim):
+    """COM displacement per frame (metres). ref/sim: [F, N, 3]."""
     n = min(len(ref), len(sim))
     com_ref = ref[:n].mean(axis=1)
     com_sim = sim[:n].mean(axis=1)
-    return np.sqrt(((com_ref - com_sim)**2).sum(axis=1))
+    return np.sqrt(((com_ref - com_sim)**2).sum(axis=1))  # [n]
 
-def compute_rmsd_per_frame(ref, sim):
+def compute_mwrmsd(ref, sim):
+    """Mass-weighted RMSD per frame.
+    Since all particles have equal mass in MPM, mwRMSD = plain RMSD.
+    If per-particle mass is available in PLY it would be used; otherwise uniform.
+    """
     n = min(len(ref), len(sim))
-    rmsds = []
+    mwrmsds = []
     for i in range(n):
-        diff = ref[i] - sim[i]
-        rmsds.append(np.sqrt((diff**2).sum(axis=1).mean()))
-    return np.array(rmsds)
+        diff = ref[i] - sim[i]   # [N, 3]
+        sq = (diff**2).sum(axis=1)  # [N]
+        mwrmsds.append(np.sqrt(sq.mean()))
+    return np.array(mwrmsds)  # [n]
 
-print("=" * 75)
-print("i-PhysGaussian Replication -- Complete Evaluation")
-print("Ficus: E=2MPa, jelly, impulse=[-0.18,0,0], 125 frames")
-print("=" * 75)
+def bmf_pass(comd_series, threshold=BMF_THRESH):
+    """BMF gate: True if ALL frames have COMD < threshold."""
+    return bool(np.all(comd_series < threshold))
 
-runs = {
-    "explicit_dt1":  ("Explicit",     "1x",  "ficus_explicit_ply"),
-    "picard_dt1":    ("Picard",       "1x",  "ficus_dt1_ply"),
-    "picard_dt3":    ("Picard",       "3x",  "ficus_dt3_ply"),
-    "picard_dt5":    ("Picard",       "5x",  "ficus_dt5_ply"),
-    "newton_dt3":    ("Newton-GMRES", "3x",  "ficus_newton_dt3_v5_ply"),
-}
+def bmf_fail_rate(comd_series, threshold=BMF_THRESH):
+    """Fraction of frames failing the BMF gate."""
+    return float(np.mean(comd_series >= threshold))
 
-print("\nLoading trajectories...")
-trajs = {}
-for key, (method, dt, dirname) in runs.items():
-    path = os.path.join(BASE, dirname)
-    if not os.path.exists(path):
-        print("  %s: NOT FOUND" % key)
-        continue
-    t = load_trajectory(path)
-    if t is None:
-        print("  %s: empty" % key)
-        continue
-    trajs[key] = t
-    print("  %-20s %3d frames, %d particles" % (key+":", len(t), t.shape[1]))
+def auc_normalised(curve, n_total):
+    """Normalised AUC of a per-frame curve (0=best, 1=worst).
+    Normalised by (n_total * max_possible_value).
+    Paper normalises by total frames and scales to [0,1].
+    """
+    if len(curve) == 0:
+        return 1.0  # worst case for failed runs
+    # Pad with worst-case (BMF_THRESH) for missing frames
+    padded = np.concatenate([curve, np.full(n_total - len(curve), BMF_THRESH)])
+    return float(padded.mean() / BMF_THRESH)
 
-print()
-print("STABILITY TABLE")
-print("-" * 55)
-stability_rows = [
-    ("Explicit",     "1x",   "explicit_dt1",  True),
-    ("Picard",       "1x",   "picard_dt1",    True),
-    ("Picard",       "3x",   "picard_dt3",    True),
-    ("Picard",       "5x",   "picard_dt5",    True),
-    ("Explicit",     "3x",   None,            False),
-    ("Explicit",     "5x",   None,            False),
-    ("Newton-GMRES", "3x",   "newton_dt3",    None),
-]
-for (method, dt, key, stable) in stability_rows:
-    label = "%s dt=%s" % (method, dt)
-    if key and key in trajs:
-        n = len(trajs[key])
-        status = "STABLE (%d/126)" % n if n == 126 else "PARTIAL (%d/126)" % n
-    elif stable is False:
-        status = "CRASH (CUDA error 700)"
-    elif stable is None:
-        status = "RUNNING (overnight)..."
-    else:
-        status = "not loaded"
-    print("  %-22s  %s" % (label, status))
-print("-" * 55)
 
-ref = trajs.get("explicit_dt1")
-if ref is None:
-    print("\nNo explicit reference.")
-else:
-    print()
-    print("ACCURACY vs EXPLICIT dt=1x (units = cm)")
-    print("-" * 75)
-    print("  %-22s %4s %6s %10s %9s %10s %9s" % (
-        "Method", "dt", "N", "COMD_mean", "COMD_max", "RMSD_mean", "RMSD_max"))
-    print("-" * 75)
-    for key, (method, dt, dirname) in runs.items():
-        if key == "explicit_dt1" or key not in trajs:
-            continue
-        sim = trajs[key]
-        n = min(len(ref), len(sim))
-        comd = compute_comd_per_frame(ref[:n], sim[:n])
-        rmsd  = compute_rmsd_per_frame(ref[:n], sim[:n])
-        label = "%s dt=%s" % (method, dt)
-        print("  %-22s %4s %6d %9.3fcm %8.3fcm %9.3fcm %8.3fcm" % (
-            label, dt, n,
-            comd.mean()*100, comd.max()*100,
-            rmsd.mean()*100,  rmsd.max()*100))
-    print("-" * 75)
+def run_eval(base_dir, scene="ficus", n_frames=126):
+    print("=" * 75)
+    print(f"  i-PhysGaussian Replication -- {scene.upper()} Evaluation")
+    print(f"  Reproducing Table 1 (BMF) and Table 7 (AUC) of arXiv 2602.17117")
+    print("=" * 75)
 
-    print()
-    print("COM TRAJECTORY (x-axis, direction of impulse)")
+    # ── Load reference (explicit k=1) ──────────────────────────────────────
+    ref_dir = os.path.join(base_dir, f"{scene}_explicit_ply")
+    ref = load_trajectory(ref_dir, n_frames)
+    if ref is None:
+        print(f"ERROR: reference not found at {ref_dir}")
+        return
+    print(f"\nReference (explicit k=1): {len(ref)} frames, {ref.shape[1]} particles\n")
+
+    # ── k-sweep definition (paper exact set) ────────────────────────────────
+    K_VALUES = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+
+    methods = {
+        "i-PhysGaussian": ("newton_gmres", f"{scene}_newton_k{{k}}_ply"),
+        "PhysGaussian":   ("picard",       f"{scene}_picard_k{{k}}_ply"),
+    }
+
+    # ── Per-method, per-k results ───────────────────────────────────────────
+    results = {}  # method -> list of (k, comd_series, mwrmsd_series, pass)
+
+    for method_name, (solver, dir_template) in methods.items():
+        results[method_name] = []
+        for k in K_VALUES:
+            run_dir = os.path.join(base_dir, dir_template.format(k=k))
+            traj = load_trajectory(run_dir, n_frames)
+            if traj is None:
+                results[method_name].append((k, None, None, False))
+                continue
+            n = min(len(ref), len(traj))
+            comd   = compute_comd(ref[:n], traj[:n])
+            mwrmsd = compute_mwrmsd(ref[:n], traj[:n])
+            passed = bmf_pass(comd)
+            results[method_name].append((k, comd, mwrmsd, passed))
+
+    # ── TABLE 1: BMF Stability Frontier ────────────────────────────────────
+    print("TABLE 1: BMF Stability Frontier")
+    print(f"  (frame fails if COMD > {BMF_THRESH*100:.0f}cm)")
     print("-" * 65)
-    ref_com = compute_com_trajectory(ref)
-    ref_com_x = ref_com[:, 0]
-    x0 = ref_com_x[0]
-    print("  %-28s x0=%.4f  max_disp=%+.2fcm  final=%+.2fcm" % (
-        "Explicit dt=1x", x0,
-        (ref_com_x - x0).max()*100,
-        (ref_com_x[-1] - x0)*100))
-    for key, (method, dt, dirname) in runs.items():
-        if key == "explicit_dt1" or key not in trajs:
-            continue
-        sim = trajs[key]
-        com_x = compute_com_trajectory(sim)[:, 0]
-        s0 = com_x[0]
-        label = "%s dt=%s" % (method, dt)
-        print("  %-28s x0=%.4f  max_disp=%+.2fcm  final=%+.2fcm" % (
-            label, s0,
-            (com_x - s0).max()*100,
-            (com_x[-1] - s0)*100))
-
-    print()
-    print("OSCILLATION ANALYSIS (elastic rebound -- sign changes in COM velocity)")
+    print(f"  {'Method':<22}  {'k_max':>6}  {'Fail%':>7}  {'Stable k values'}")
     print("-" * 65)
-    for key, (method, dt, dirname) in runs.items():
-        if key not in trajs:
-            continue
-        sim = trajs[key]
-        com_x = compute_com_trajectory(sim)[:, 0]
-        dcom = np.diff(com_x)
-        sc = int(np.sum(np.diff(np.sign(dcom)) != 0))
-        label = "Explicit dt=1x" if key == "explicit_dt1" else "%s dt=%s" % (method, dt)
-        osc = "YES -- elastic rebound" if sc >= 3 else "NO  -- over-damped"
-        print("  %-28s sign_changes=%3d  -> %s" % (label, sc, osc))
 
-print()
-print("=" * 75)
+    # Paper reference values for ficus
+    paper_ref = {
+        "i-PhysGaussian": (20, 0.0),
+        "PhysGaussian":   (1,  90.9),
+    }
+
+    for method_name in methods:
+        res = results[method_name]
+        passed_ks = [k for k, _, _, p in res if p]
+        failed_ks = [k for k, c, _, p in res if c is not None and not p]
+        missing_ks = [k for k, c, _, _ in res if c is None]
+        k_max = max(passed_ks) if passed_ks else 0
+        total_tested = len([r for r in res if r[1] is not None])
+        n_failed = len(failed_ks)
+        fail_pct = 100.0 * n_failed / len(K_VALUES) if total_tested > 0 else 100.0
+
+        paper_kmax, paper_fail = paper_ref.get(method_name, (None, None))
+        paper_str = f"  [paper: k_max={paper_kmax}, fail={paper_fail}%]" if paper_kmax else ""
+
+        print(f"  {method_name:<22}  {k_max:>6}  {fail_pct:>6.1f}%  {passed_ks}")
+        if missing_ks:
+            print(f"  {'':22}  {'':>6}  {'':>7}  (missing runs: k={missing_ks})")
+        if paper_str:
+            print(f"  {'':22}  {paper_str}")
+    print("-" * 65)
+
+    # ── TABLE 7: Normalised AUC ─────────────────────────────────────────────
+    print(f"\nTABLE 7: Normalised AUC of COMD and mwRMSD (lower = better)")
+    print("-" * 55)
+    print(f"  {'Method':<22}  {'COMD AUC':>10}  {'mwRMSD AUC':>12}")
+    print("-" * 55)
+
+    paper_auc = {
+        "i-PhysGaussian": (0.0184, 0.0279),
+        "PhysGaussian":   (0.5975, 0.8509),
+    }
+
+    for method_name in methods:
+        res = results[method_name]
+        # Only include BMF-passing runs in AUC (paper does this)
+        comd_aucs, mwrmsd_aucs = [], []
+        for k, comd, mwrmsd, passed in res:
+            if comd is not None and passed:
+                comd_aucs.append(auc_normalised(comd, n_frames))
+                mwrmsd_aucs.append(auc_normalised(mwrmsd, n_frames))
+
+        if comd_aucs:
+            cauc = np.mean(comd_aucs)
+            mauc = np.mean(mwrmsd_aucs)
+        else:
+            cauc = mauc = float('nan')
+
+        pa, pm = paper_auc.get(method_name, (None, None))
+        paper_str = f"  [paper: COMD={pa}, mwRMSD={pm}]" if pa else ""
+        print(f"  {method_name:<22}  {cauc:>10.4f}  {mauc:>12.4f}")
+        if paper_str:
+            print(f"  {'':22}  {paper_str}")
+    print("-" * 55)
+
+    # ── Per-k accuracy detail ───────────────────────────────────────────────
+    print(f"\nPER-K ACCURACY DETAIL")
+    print(f"  {'Method':<22}  {'k':>3}  {'BMF':>5}  {'COMD_mean':>10}  {'mwRMSD_mean':>12}")
+    print("-" * 65)
+    for method_name in methods:
+        for k, comd, mwrmsd, passed in results[method_name]:
+            if comd is None:
+                print(f"  {method_name:<22}  {k:>3}  {'--':>5}  {'(no run)':>10}")
+            else:
+                bmf_str = "PASS" if passed else "FAIL"
+                print(f"  {method_name:<22}  {k:>3}  {bmf_str:>5}  "
+                      f"{comd.mean()*100:>9.3f}cm  {mwrmsd.mean()*100:>11.3f}cm")
+    print("-" * 65)
+
+    # ── COM trajectory oscillation ──────────────────────────────────────────
+    print(f"\nELASTIC REBOUND (sign changes in COM velocity, k=1 runs)")
+    print("-" * 55)
+    for method_name, (solver, dir_template) in methods.items():
+        run_dir = os.path.join(base_dir, dir_template.format(k=1))
+        traj = load_trajectory(run_dir, n_frames)
+        if traj is not None:
+            com_x = traj.mean(axis=1)[:, 0]
+            sc = int(np.sum(np.diff(np.sign(np.diff(com_x))) != 0))
+            osc = "YES" if sc >= 3 else "NO (over-damped)"
+            print(f"  {method_name:<22}  sign_changes={sc:3d}  -> {osc}")
+    # Reference
+    com_x = ref.mean(axis=1)[:, 0]
+    sc = int(np.sum(np.diff(np.sign(np.diff(com_x))) != 0))
+    print(f"  {'Explicit k=1':<22}  sign_changes={sc:3d}  -> {'YES' if sc >= 3 else 'NO'} (reference)")
+    print("=" * 75)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base", default="/root/autodl-tmp/PhysGaussian/output",
+                        help="Base output directory")
+    parser.add_argument("--scene", default="ficus", help="Scene name")
+    parser.add_argument("--n_frames", type=int, default=126)
+    args = parser.parse_args()
+    run_eval(args.base, args.scene, args.n_frames)

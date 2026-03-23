@@ -235,7 +235,8 @@ def decode_param_json(json_file):
 
 
 def set_boundary_conditions(
-    mpm_solver: MPM_Simulator_WARP, bc_params: dict, time_params: dict
+    mpm_solver: MPM_Simulator_WARP, bc_params: dict, time_params: dict,
+    impulse_scale: float = 1.0
 ):
     for bc in bc_params:
         if bc["type"] == "cuboid":
@@ -276,8 +277,9 @@ def set_boundary_conditions(
             if "size" in bc.keys():
                 size = bc["size"]
 
+            scaled_force = [f * impulse_scale for f in bc["force"]]
             mpm_solver.add_impulse_on_particles(
-                force=bc["force"],
+                force=scaled_force,
                 dt=time_params["substep_dt"],
                 point=point,
                 size=size,

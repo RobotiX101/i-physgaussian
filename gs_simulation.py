@@ -84,6 +84,8 @@ if __name__ == "__main__":
                         help="Multiply substep_dt by this factor (for large-step stability test)")
     parser.add_argument("--solver", default="picard", choices=["picard", "newton_gmres"],
                         help="Implicit solver: picard (default) or newton_gmres")
+    parser.add_argument("--impulse_scale", type=float, default=1.0,
+                        help="Scale particle_impulse forces by this factor (paper: 1/k keeps total impulse constant)")
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -265,7 +267,7 @@ if __name__ == "__main__":
     mpm_solver.set_parameters_dict(material_params)
 
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
-    set_boundary_conditions(mpm_solver, bc_params, time_params)
+    set_boundary_conditions(mpm_solver, bc_params, time_params, impulse_scale=args.impulse_scale)
 
     mpm_solver.finalize_mu_lam()
 
