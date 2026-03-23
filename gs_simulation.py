@@ -82,7 +82,7 @@ if __name__ == "__main__":
                         help="Use ImplicitMPMSolver (Picard iteration) instead of explicit")
     parser.add_argument("--dt_multiplier", type=float, default=1.0,
                         help="Multiply substep_dt by this factor (for large-step stability test)")
-    parser.add_argument("--solver", default="picard", choices=["picard", "newton_gmres"],
+    parser.add_argument("--solver", default="picard", choices=["picard", "picard_vanilla", "newton_gmres"],
                         help="Implicit solver: picard (default) or newton_gmres")
     parser.add_argument("--impulse_scale", type=float, default=1.0,
                         help="Scale particle_impulse forces by this factor (paper: 1/k keeps total impulse constant)")
@@ -343,6 +343,8 @@ if __name__ == "__main__":
             for step in range(actual_steps):
                 if args.solver == "newton_gmres":
                     mpm_solver.p2g2p_newton_gmres(frame * actual_steps + step, actual_dt)
+                elif args.solver == "picard_vanilla":
+                    mpm_solver.p2g2p_picard_vanilla(frame * actual_steps + step, actual_dt)
                 else:
                     mpm_solver.p2g2p_implicit(frame * actual_steps + step, actual_dt)
         else:

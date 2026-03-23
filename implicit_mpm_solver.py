@@ -56,7 +56,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         self.implicit_max_iters = 30          # Picard iterations per step
         self.implicit_tolerance = 1e-4        # L2 convergence threshold
         self.implicit_relaxation = 0.7        # Under-relaxation factor (1.0 = no relaxation)
-        self.newton_max_iters = 5             # Newton outer iterations (paper: 3-5)
+        self.newton_max_iters = 25            # Newton outer iterations (adaptive: 3-25)
         self.gmres_max_iters = 15            # GMRES Krylov vectors per cycle (paper Eq.19)
 
         # Pre-allocated persistent warp buffer for grid velocity writes
@@ -298,6 +298,159 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
     # Private helpers
     # ------------------------------------------------------------------
 
+    def p2g2p_picard_vanilla(self, step: int, dt: float) -> Dict:
+        """
+        Vanilla Picard baseline (paper PhysGaussian comparison).
+        
+        Differences from p2g2p_implicit:
+        - 5-10 iterations (not 30)
+        - No under-relaxation (relaxation=1.0)
+        - No best-iterate strategy
+        - Matches paper's unstable baseline
+        """
+        device = self.device
+        grid_size = (self.mpm_model.grid_dim_x,
+                     self.mpm_model.grid_dim_y,
+                     self.mpm_model.grid_dim_z)
+
+        # Step 1: Pre-P2G ops (impulses)
+        for k in range(len(self.pre_p2g_operations)):
+            wp.launch(
+                kernel=self.pre_p2g_operations[k],
+                dim=self.n_particles,
+                inputs=[self.time, dt, self.mpm_state, self.impulse_params[k]],
+                device=device,
+            )
+
+        for k in range(len(self.particle_velocity_modifiers)):
+            wp.launch(
+                kernel=self.particle_velocity_modifiers[k],
+                dim=self.n_particles,
+                inputs=[self.time, self.mpm_state,
+                        self.particle_velocity_modifier_params[k]],
+                device=device,
+            )
+
+        # Step 2: Save state
+        self._save_state()
+
+        # Step 3: Initial explicit guess
+        wp.launch(kernel=mpm.zero_grid, dim=grid_size,
+                  inputs=[self.mpm_state, self.mpm_model], device=device)
+        wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+        wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+        grid_v_cur = self._grid_velocity_from_p2g(dt)
+        if len(self.grid_postprocess) > 0:
+            self._write_grid_v(grid_v_cur)
+            for k in range(len(self.grid_postprocess)):
+                wp.launch(kernel=self.grid_postprocess[k], dim=grid_size,
+                          inputs=[self.time, dt, self.mpm_state, self.mpm_model,
+                                  self.collider_params[k]], device=device)
+            grid_v_cur = self.mpm_state.grid_v_out.numpy()
+
+        # Step 4: Vanilla Picard iterations (5-10 iters, no relaxation)
+        converged = False
+        residual = float('inf')
+        n_iters = 0
+        vanilla_max_iters = 10  # Paper baseline: 5-10 iterations
+
+        for it in range(vanilla_max_iters):
+            n_iters = it + 1
+
+            self._restore_state()
+
+            v_max = min(50.0, 0.4 * self.mpm_model.grid_lim / dt)
+            grid_v_capped = np.clip(grid_v_cur, -v_max, v_max)
+            self._update_x_F(grid_v_capped, dt, apply_bc=True)
+            wp.copy(self.mpm_state.particle_x, self._buf_x)
+            wp.synchronize_device(self.device)
+
+            wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
+                      inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+            wp.launch(kernel=mpm.zero_grid, dim=grid_size,
+                      inputs=[self.mpm_state, self.mpm_model], device=device)
+            wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
+                      inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+            grid_v_new = self._grid_velocity_from_p2g(dt)
+            if len(self.grid_postprocess) > 0:
+                self._write_grid_v(grid_v_new)
+                for k in range(len(self.grid_postprocess)):
+                    wp.launch(kernel=self.grid_postprocess[k], dim=grid_size,
+                              inputs=[self.time, dt, self.mpm_state, self.mpm_model,
+                                      self.collider_params[k]], device=device)
+                grid_v_new = self.mpm_state.grid_v_out.numpy()
+            grid_v_new = np.clip(grid_v_new, -v_max, v_max)
+
+            diff = grid_v_new - grid_v_cur
+            residual = float(np.sqrt(np.nansum(diff ** 2)))
+
+            if residual < self.implicit_tolerance:
+                converged = True
+                grid_v_cur = grid_v_new
+                break
+
+            # NO under-relaxation (vanilla baseline)
+            grid_v_cur = grid_v_new
+
+        # Step 5: Restore and finalize
+        self._restore_state()
+        wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+        if self.mpm_model.grid_v_damping_scale < 1.0:
+            grid_v_cur = grid_v_cur * self.mpm_model.grid_v_damping_scale
+
+        self._write_grid_v(grid_v_cur)
+
+        for k in range(len(self.grid_postprocess)):
+            wp.launch(
+                kernel=self.grid_postprocess[k],
+                dim=grid_size,
+                inputs=[self.time, dt, self.mpm_state, self.mpm_model,
+                        self.collider_params[k]],
+                device=device,
+            )
+            if self.modify_bc[k] is not None:
+                self.modify_bc[k](self.time, dt, self.collider_params[k])
+
+        wp.launch(kernel=mpm.g2p, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+        wp.launch(
+            kernel=clamp_particle_positions,
+            dim=self.n_particles,
+            inputs=[
+                self.mpm_state.particle_x,
+                self.mpm_state.particle_v,
+                self.mpm_state.particle_selection,
+                self.mpm_model.inv_dx,
+                self.mpm_model.n_grid,
+            ],
+            device=device,
+        )
+
+        self.time += dt
+
+        particle_v_np = self.mpm_state.particle_v.numpy()
+        max_v = float(np.max(np.abs(particle_v_np)))
+        gv_max = float(np.max(np.abs(grid_v_cur))) if np.all(np.isfinite(grid_v_cur)) else float('inf')
+        print(f"[Picard-Vanilla] step={step} iters={n_iters} converged={converged} "
+              f"res={residual:.3e} gv_max={gv_max:.2f} max_v={max_v:.3f}",
+              flush=True)
+        return {
+            'converged': converged,
+            'iterations': n_iters,
+            'final_residual': residual,
+            'max_velocity': max_v,
+        }
+
+
+
     def _picard_eval_ul(self, grid_v: np.ndarray, dt: float,
                         grid_size: tuple, v_max: float) -> np.ndarray:
         """
@@ -449,6 +602,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         EW_eta_min = 1e-4
         EW_gamma   = 0.9    # safeguard parameter
         EW_alpha   = 1.5    # choice parameter
+        min_newton_iters = 3  # Minimum iterations before early exit
         prev_res_norm = None
         prev_prev_res_norm = None
         eta_k = EW_eta_max  # start loose, tighten as Newton converges
@@ -466,6 +620,16 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
                 converged = True
                 final_residual = res_norm
                 break
+
+            # Stagnation check (after min_newton_iters)
+            if newton_it >= min_newton_iters and prev_res_norm is not None:
+                if prev_res_norm > 1e-14:
+                    reduction = prev_res_norm / res_norm
+                    # Exit if contraction < 0.95 (stagnating)
+                    if reduction < 0.95:
+                        if step == 0:
+                            print(f"  [Newton] stagnation at iter {newton_it}, reduction={reduction:.3f}", flush=True)
+                        break
             final_residual = res_norm
 
             # ---- Eisenstat-Walker adaptive tolerance (paper) ----
