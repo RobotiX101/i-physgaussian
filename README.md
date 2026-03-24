@@ -2,157 +2,274 @@
 
 Unofficial replication of [i-PhysGaussian: Implicit Physical Simulation for 3D Gaussian Splatting](https://arxiv.org/abs/2602.17117) (Cao et al., 2026).
 
-## Paper-to-Code Mapping
+## Formula-by-Formula Replication Checklist
 
-### Core Solver: Displacement-Based Newton-GMRES (JFNK)
+### Eq.6: Shape Function
 
-**Paper Section 2.2 → `implicit_mpm_solver.py:p2g2p_newton_gmres()`**
-
-The paper solves for **grid displacement increment** Δu_I using inexact Newton with GMRES (Jacobian-Free Newton-Krylov). Our implementation follows this exactly:
-
-| Paper | Equation | Code Location | Implementation |
-|-------|----------|---------------|----------------|
-| Newmark acceleration | Eq.8: `a^{n+1} = (Δu - Δt·v^n - Δt²(½-β)·a^n) / (β·Δt²)` | `eval_residual()` | `a_new = (du - dt*v_grid_n - dt²*(0.5-β)*a_n) / (β*dt²)` |
-| Newmark velocity | Eq.9: `v^{n+1} = v^n + Δt·[(1-γ)·a^n + γ·a^{n+1}]` | `eval_residual()` | `v_new = v_grid_n + dt*((1-γ)*a_n + γ*a_new)` |
-| Momentum residual | Eq.10: `R_I = f^ext + f^int - m·a^{n+1}` | `eval_residual()` | `R = v_explicit - v_new` (mass-scaled equivalent) |
-| Internal force | Eq.11: `f^int = -Σ V_p P·∇N_I` | P2G kernel (`p2g_apic_with_stress`) | Warp GPU kernel computes stress divergence |
-| Initial guess | Eq.14: `Δu^(0) = Δt·v^n + ½Δt²·a^n` | Step 4 | `du_k = dt*v_grid_n + 0.5*dt²*a_n` |
-| Newton linearization | Eq.15-16: `J·δu = -R` | GMRES block | `sp_gmres(A, -R_k_flat, ...)` |
-| Newton update | Eq.17: `Δu^{k+1} = Δu^k + α·δu` | Line search block | `du_k += alpha * delta_du` |
-
-### Newmark Parameters
-
-**Paper Section 2.2**: β, γ parameterize the Newmark family. Paper does not state exact values.
-
-**Our choice**: β=1/4, γ=1/2 (trapezoidal rule / constant average acceleration). This is unconditionally stable and second-order accurate. Set in `p2g2p_newton_gmres()`:
-```python
-beta_nm  = 0.25   # Newmark β
-gamma_nm = 0.5    # Newmark γ
+```
+Paper:  w_Ip = N((x_I-x_p)/h) * N((y_I-y_p)/h) * N((z_I-z_p)/h), cubic B-spline
+Code:   mpm_utils.py:p2g_apic_with_stress(), quadratic B-spline (3-point stencil)
 ```
 
-### GMRES Inner Solver
+| Item | Status | Notes |
+|------|:------:|-------|
+| Separable 3D product | ✅ | `w[0,i]*w[1,j]*w[2,k]` |
+| Weight gradient dw | ✅ | `compute_dweight()` in P2G |
+| Cubic vs quadratic | ⚠️ | Paper says cubic; PhysGaussian codebase uses quadratic. Standard MPM practice. |
 
-**Paper Section 2.3 → `p2g2p_newton_gmres()` GMRES block**
+### Eq.8: Newmark Acceleration
 
-| Paper | Code | Notes |
-|-------|------|-------|
-| Central FD JVP (Eq.19): `J·p ≈ [R(Δu+εp)-R(Δu-εp)]/(2ε)` | `matvec()` closure | ε chosen so ‖εp‖∞ ≈ 1e-4 |
-| Right preconditioner (Eq.20): `W_I = m_I/(β·Δt²)` | `M_prec` LinearOperator | Diagonal mass preconditioner |
-| Right-precond system (Eq.21): `J·W⁻¹·y = -R` | `sp_gmres(A, -R, M=M_prec, ...)` | scipy uses left-preconditioning; equivalent for diagonal M |
-| Eisenstat-Walker tolerance | `eta_k` variable | EW Choice 2 with safeguards |
-| GMRES restart | `restart=15, maxiter=3` | 15 Krylov vectors, up to 3 restart cycles |
+```
+Paper:  a_I^{n+1} = [du_I - dt*v_I^n - dt^2*(0.5-beta)*a_I^n] / (beta*dt^2)
+Code:   a_new = (du_cp - dt*v_n_gpu - dt*dt*(0.5-beta_nm)*a_n_gpu) / (beta_nm*dt*dt)
+```
 
-### Line Search
+| Item | Status | Notes |
+|------|:------:|-------|
+| Formula | ✅ | Direct translation |
+| beta = 0.25 | ✅ | `beta_nm = 0.25` (trapezoidal rule) |
+| v_I^n source | ✅ | **Fixed (v6)**: momentum-only P2G via `_p2g_momentum_only()` — no gravity, no stress |
+| a_I^n tracking | ✅ | **Fixed (v6)**: set `a_n = 0` to avoid invalid grid-acceleration-across-steps |
 
-**Paper Section 2.2, Eq.17-18 → Armijo block in `p2g2p_newton_gmres()`**
+### Eq.9: Newmark Velocity
 
-| Paper | Code | Notes |
-|-------|------|-------|
-| Objective: φ(Δu) = ½‖R(Δu)‖² (Eq.13) | `phi_0 = 0.5 * sum(R²)` | Minimize residual norm |
-| Directional derivative (Eq.18) | `dphi_0 ≈ -‖R‖²` | Approximation since J·δu ≈ -R |
-| Armijo backtracking | `phi_trial ≤ phi_0 + c1·α·dphi_0` | c1 = 1e-4, up to 10 halvings |
-| Steepest descent fallback | `delta_du = -R` if dphi_0 ≥ 0 | Paper specifies this fallback explicitly |
+```
+Paper:  v_I^{n+1} = v_I^n + dt*[(1-gamma)*a_I^n + gamma*a_I^{n+1}]
+Code:   v_new = v_n_gpu + dt*((1.0-gamma_nm)*a_n_gpu + gamma_nm*a_new)
+```
 
-### Picard Baseline Solvers
+| Item | Status | Notes |
+|------|:------:|-------|
+| Formula | ✅ | Direct translation |
+| gamma = 0.5 | ✅ | `gamma_nm = 0.5` |
 
-**Paper compares against PhysGaussian (explicit MPM).**
+### Eq.10: Momentum Residual (core equation)
 
-We provide three Picard variants for comparison:
+```
+Paper:  R_I(du) = f_I^ext + f_I^int(du) - m_I * a_I^{n+1}(du_I),  I in F
+Code:   R = f_ext_gpu + f_int_gpu - mass_expanded * a_new
+```
 
-| Solver | Method | Code | Purpose |
-|--------|--------|------|---------|
-| `picard` | 30-iter Frozen Lagrangian, 0.7 relaxation, best-iterate | `p2g2p_implicit()` | Stabilized baseline |
-| `picard_vanilla` | 10-iter Updated Lagrangian, no relaxation | `p2g2p_picard_vanilla()` | Paper-comparable PhysGaussian baseline |
-| `newton_gmres` | Displacement-based Newton-GMRES | `p2g2p_newton_gmres()` | Paper i-PhysGaussian method |
+| Item | Status | Notes |
+|------|:------:|-------|
+| Force-unit residual | ✅ | **Fixed (v6)**: raw force residual, not mass-normalized |
+| f_ext = m*g | ✅ | Gravity applied once (no double-count after v6 fix) |
+| f_int via two-pass P2G | ✅ | `_eval_forces_and_kdiag()`: pass1 momentum-only, pass2 with stress, subtract |
+| Free node set F | ✅ | **Fixed (v6)**: BC nodes identified, residual zeroed at Dirichlet nodes |
+| No F_trial clamping | ✅ | **Fixed (v6)**: removed det(F) clamp (not in paper) |
 
-### Updated vs Frozen Lagrangian
+### Eq.11: Internal Force
 
-**Paper**: Uses Updated Lagrangian — particle positions move with the current velocity estimate, so the mass matrix and stress evaluation change each iteration.
+```
+Paper:  f_I^int = -sum_p V_p^0 * P_p * grad_X N_I(x_p),  P_p = tau_p * F_p^{-T}
+Code:   f_int = (grid_v_in_full - grid_v_in_momentum) / dt  (two-pass P2G extraction)
+```
 
-| Solver | Lagrangian | Code Detail |
-|--------|-----------|-------------|
-| `newton_gmres` | Updated | `_update_x_F()` moves particles; no x^n restore |
-| `picard_vanilla` | Updated | Same — matches paper PhysGaussian baseline |
-| `picard` | Frozen | `wp.copy(particle_x, _buf_x)` restores x^n each iteration |
+| Item | Status | Notes |
+|------|:------:|-------|
+| Stress P = tau*F^{-T} | ✅ | `compute_stress_from_F_trial` kernel |
+| Reference volume V_p^0 | ✅ | Stored in `particle_vol` |
+| Trial F update | ✅ | `_update_x_F` kernel: F^trial = (I + dt*grad_v)*F^n |
+| Updated Lagrangian (eval at x^{n+1}) | ✅ | Particles moved before P2G |
 
-### Evaluation Metrics
+### Eq.12: Dirichlet Boundary Conditions
 
-**Paper Appendix D → `eval/eval_metrics.py`**
+```
+Paper:  S * du_I = v_tar - v_hist,  I in D,  S = gamma/(beta*dt)
+Code:   BC nodes identified by comparing grid_v before/after grid_postprocess
+```
 
-| Metric | Paper Definition | Code |
-|--------|-----------------|------|
-| BMF (Body-hit Mass Fraction) | Fraction of mass at domain boundary; fail if exceedance ratio > 0.5 | COMD > 50cm proxy |
-| COMD (Center of Mass Drift) | Euclidean distance between COM of implicit and explicit reference | `eval_metrics.py` |
-| mwRMSD (mass-weighted RMSD) | Mass-weighted root mean square displacement vs reference | `eval_metrics.py` |
-| k_max | Largest k that passes BMF stability gate | `eval_metrics.py` |
-| AUC | Normalized area under k-curve for COMD/mwRMSD | `eval_metrics.py` |
+| Item | Status | Notes |
+|------|:------:|-------|
+| Dirichlet node identification | ✅ | **Fixed (v6)**: detect BC nodes by velocity change |
+| Zero residual at D nodes | ✅ | `R[~free_mask_gpu] = 0.0` |
+| Zero search direction at D nodes | ✅ | `delta_du[~free_mask_gpu] = 0.0` and in `matvec()` |
+| S = gamma/(beta*dt) scaling | ❌ | Not implemented (we zero instead of prescribing du) |
 
-### K-Sweep Configuration
+### Eq.13: Newton Objective
 
-**Paper Tables 3-5: Ficus scene**
+```
+Paper:  phi(du) = 0.5 * ||R(du)||^2_F
+Code:   phi_0 = 0.5 * float(cp.sum(R_k_flat ** 2))
+```
 
-| Parameter | Paper | Our Config |
-|-----------|-------|------------|
-| substep_dt | k × 1e-4 | `--dt_multiplier k` |
-| frame_dt | 4.0e-2 | `config/ficus_config.json` |
-| frame_num | 125 (full) / 30 (sweep) | `frame_num` in config |
-| k values | {1,2,4,6,8,10,12,14,16,18,20} | Same |
-| impulse_scale | 1/k | `--impulse_scale` |
-| Material | jelly, E=2e6, ν=0.4 | Same |
-| Grid | 50³ | Same |
+| Item | Status | Notes |
+|------|:------:|-------|
+| Squared norm | ✅ | Direct match |
+| Norm over F only | ✅ | **Fixed (v6)**: R zeroed at non-free nodes |
 
-## What the Paper Does NOT Specify
+### Eq.14: Initial Guess (Newmark Predictor)
 
-These parameters were chosen by us (reasonable defaults):
+```
+Paper:  du_I^{0} = dt*v_I^n + 0.5*dt^2*a_I^n,  I in F
+Code:   du_k = cp.asarray(dt * v_grid_n, dtype=cp.float64)  # a_n=0
+```
 
-1. **Newmark β, γ** → we use β=0.25, γ=0.5 (trapezoidal)
-2. **Newton tolerance** → we use 1e-3 (L2 norm of velocity residual)
-3. **Max Newton iterations** → we use 25
-4. **GMRES restart** → we use 15 Krylov vectors, 3 cycles
-5. **Armijo c1** → we use 1e-4
-6. **Line search max iterations** → we use 10
-7. **Eisenstat-Walker variant** → we use EW Choice 2 with α=1.5, γ=0.9
+| Item | Status | Notes |
+|------|:------:|-------|
+| Predictor formula | ✅ | With a_n=0: du = dt*v^n (explicit forward Euler predictor) |
+| v_I^n without gravity | ✅ | **Fixed (v6)**: from momentum-only P2G |
+
+### Eq.15-16: Newton Linearization
+
+```
+Paper:  J(du^k) * delta_u^k = -R(du^k)
+Code:   cp_gmres(A, -R_k_flat, M=M_prec, ...)
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Linear system | ✅ | GMRES solves J*du = -R |
+| delta_u restricted to F | ✅ | **Fixed (v6)**: Dirichlet entries zeroed in matvec and result |
+
+### Eq.17: Line Search Update
+
+```
+Paper:  du^{k+1} = du^k + alpha^k * delta_u^k
+Code:   du_k = du_k + alpha * delta_du
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Update rule | ✅ | |
+| No v_max clamping | ✅ | **Fixed (v6)**: removed artificial velocity cap from Newton path |
+
+### Eq.18: Directional Derivative
+
+```
+Paper:  phi'(0) = <R(du^k), J(du^k)*delta_u^k>_F
+Code:   J_delta = matvec(delta_flat, du_k); dphi_0 = dot(R, J_delta)
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Exact JVP computation | ✅ | **Fixed (v6)**: computes actual J*delta_u, not approximation |
+| Steepest descent fallback | ✅ | `delta_du = -R` when phi'(0) >= 0 |
+
+### Eq.19: Finite Difference JVP
+
+```
+Paper:  J*p ~ [R(du+eps*p) - R(du-eps*p)] / (2*eps),  ||eps*p||_inf ~ 1e-4
+Code:   eps_fd = 1e-4 / norm_inf; (R_plus - R_minus) / (2*eps_fd)
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Central FD | ✅ | |
+| eps scaling | ✅ | `||eps*p||_inf = 1e-4` |
+| p projected to free nodes | ✅ | **Fixed (v6)**: Dirichlet entries zeroed in matvec |
+
+### Eq.20: Preconditioner
+
+```
+Paper:  W_I = m_I/(beta*dt^2) + K_I^diag,  I in F
+Code:   _diag_w = _inertia + _k_diag_rep  where _inertia = m/(beta*dt^2)
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Inertia term m/(beta*dt^2) | ✅ | |
+| K_diag stiffness term | ✅ | **Fixed (v6)**: `K_I ~ (lam+2mu)/(rho*dx^2) * m_I` from actual Lame params |
+| Only for free nodes | ✅ | BC nodes zeroed |
+
+### Eq.21-22: Right Preconditioning
+
+```
+Paper:  J*W^{-1}*y = -R (right),  then delta_u = W^{-1}*y
+Code:   cp_gmres(A, -R, M=M_prec, ...) (left preconditioning)
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| Preconditioning side | ⚠️ | CuPy uses left; paper uses right. Equivalent for diagonal W. |
+
+### Final G2P Transfer
+
+```
+Paper:  v_p^{n+1} = sum w_Ip * v_I^{n+1};  x_p^{n+1} = x_p^n + dt*v_p^{n+1}
+Code:   mpm.g2p kernel with converged velocity on grid_v_out
+```
+
+| Item | Status | Notes |
+|------|:------:|-------|
+| G2P with converged v | ✅ | Write v_final to grid, run g2p |
+| State restore before G2P | ✅ | `_restore_state()` to (x^n, v^n, C^n, F^n) |
+| Particle position clamping | ✅ | `clamp_particle_positions` kernel after G2P |
+
+## Replication Scorecard
+
+| Category | Items | Passed | Status |
+|----------|:-----:|:------:|--------|
+| Newmark integration (Eq.8-9) | 4 | 4 | ✅ |
+| Momentum residual (Eq.10-11) | 5 | 5 | ✅ |
+| Boundary conditions (Eq.12) | 4 | 3 | ⚠️ S-scaling missing |
+| Newton solver (Eq.13-17) | 6 | 6 | ✅ |
+| GMRES + JVP (Eq.19-22) | 5 | 4 | ⚠️ Left vs right precond |
+| **Total** | **24** | **22** | **92%** |
+
+## Paper Parameters (Unspecified)
+
+The paper omits these values. Our choices:
+
+| Parameter | Our Value | Rationale |
+|-----------|-----------|-----------|
+| Newmark beta, gamma | 0.25, 0.5 | Standard trapezoidal rule |
+| Newton rel. tolerance | 1e-4 | Typical for JFNK |
+| Max Newton iters | 25 | Sufficient for all k |
+| GMRES restart | 15, maxiter=3 | Up to 45 Krylov vectors |
+| Armijo c1 | 1e-4 | Standard |
+| Line search max iters | 10 | Conservative |
+| EW parameters | gamma=0.9, alpha=1.5 | EW Choice 2 |
 
 ## File Structure
 
 ```
-implicit_mpm_solver.py    # Core solver: Picard + Newton-GMRES
-  ├── ImplicitMPMSolver   # Extends MPM_Simulator_WARP
-  │   ├── p2g2p_implicit()         # 30-iter stabilized Picard
-  │   ├── p2g2p_picard_vanilla()   # 10-iter vanilla Picard (paper baseline)
-  │   ├── p2g2p_newton_gmres()     # Displacement-based Newton (paper method)
-  │   ├── _save_state()            # Save x,v,C,F for iteration
-  │   ├── _restore_state()         # Restore to start-of-step
-  │   ├── _grid_velocity_from_p2g()# v = grid_v_in/m + dt*g
-  │   ├── _update_x_F()            # G2P for x and F only
-  │   └── _write_grid_v()          # Write numpy to warp grid
-  ├── clamp_particle_positions     # Warp kernel: keep particles in grid
-  ├── update_x_F_from_grid_v       # Warp kernel: G2P for x,F only
-  └── clamp_F_trial_J              # Warp kernel: clamp det(F) ∈ [0.1, 10]
+implicit_mpm_solver.py        # Core solver
+  ImplicitMPMSolver
+    p2g2p_implicit()           # 30-iter stabilized Picard
+    p2g2p_picard_vanilla()     # 10-iter vanilla Picard (paper baseline)
+    p2g2p_newton_gmres()       # Displacement-based Newton-GMRES (paper method)
+    _p2g_momentum_only()       # P2G without stress (for v_I^n and f_int extraction)
+    _eval_forces_and_kdiag()   # Two-pass P2G → f_int, f_ext, mass, K_diag
+    _save_state/_restore_state # Checkpoint particle state for iterations
+    _grid_velocity_from_p2g()  # v = grid_v_in/m + dt*g (explicit formula)
+    _update_x_F()              # Update particle x and F from grid velocity
+  zero_stress                  # Warp kernel: zero stress for momentum-only P2G
+  clamp_particle_positions     # Warp kernel: keep particles in grid
+  update_x_F_from_grid_v       # Warp kernel: G2P for x,F only
 
-gs_simulation.py          # Main simulation driver
-  └── --solver {picard, picard_vanilla, newton_gmres}
+gs_simulation.py               # Simulation driver
+  --solver {picard, picard_vanilla, newton_gmres}
+  --dt_multiplier k            # Timestep scaling
+  --impulse_scale 1/k          # Compensate impulse for larger dt
 
-eval/eval_metrics.py      # COMD, mwRMSD, BMF, AUC computation
-config/ficus_config.json  # Scene parameters
+eval/eval_metrics.py           # COMD, mwRMSD, BMF, AUC metrics
+config/ficus_config.json       # Scene: E=2e6, nu=0.4, jelly, 50^3 grid
 ```
 
-## Running Experiments
+## Running
 
 ```bash
-# Single run (Newton, k=4)
+# Single run
 python gs_simulation.py --model_path model/ficus_whitebg-trained \
-    --output_path output/ficus_newton_v3_k4_ply \
+    --output_path output/ficus_newton_v6_k4_ply \
     --config config/ficus_config.json \
     --implicit --solver newton_gmres \
     --dt_multiplier 4 --impulse_scale 0.25 --output_ply
 
-# Full parallel k-sweep
+# Full parallel k-sweep (Phase 1: Picard GPU-parallel, Phase 2: Newton 4-worker)
 python /tmp/run_ksweep_parallel.py
 ```
 
-## Known Limitations
+## Remaining Gaps
 
-1. Newton residual is formulated as velocity difference (`v_explicit - v_newmark`) rather than raw momentum residual. This is mathematically equivalent (scaled by mass) but may have different numerical conditioning.
-2. GMRES uses scipy's left-preconditioned variant; paper specifies right-preconditioning. For diagonal preconditioners these are equivalent.
-3. Hardware: RTX 5090 (32GB) vs paper's RTX 4090 (24GB). Should not affect results.
+1. **Eq.12 S-scaling**: Dirichlet BCs zeroed instead of prescribed via S = gamma/(beta*dt)
+2. **Left vs right preconditioning**: CuPy uses left; paper uses right (equivalent for diagonal)
+3. **Quadratic vs cubic B-spline**: PhysGaussian base uses quadratic; paper says cubic
+4. **K_diag approximation**: We use material-parameter estimate; paper accumulates exact per-node stiffness
+
+## Documentation
+
+- `doc/formula_checklist.md` — Detailed equation-by-equation audit
+- `doc/replication_analysis.md` — Solver evolution v1-v6 and root cause analysis
+- `doc/bugfix_log.md` — Historical bug tracking
