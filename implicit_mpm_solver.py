@@ -54,7 +54,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
         # Solver parameters
         self.implicit_max_iters = 30          # Picard iterations per step
-        self.implicit_tolerance = 5.0         # L2 convergence threshold (momentum/force units)
+        self.implicit_tolerance = 1e-4        # Relative convergence threshold ||R||/||R_0||
         self.implicit_relaxation = 0.7        # Under-relaxation factor (1.0 = no relaxation)
         self.newton_max_iters = 25            # Newton outer iterations (adaptive: 3-25)
         self.gmres_max_iters = 15            # GMRES Krylov vectors per cycle (paper Eq.19)
@@ -675,8 +675,12 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             a_new_expanded = a_new  # already (N,N,N,3)
             mass_expanded = cp.expand_dims(mass_local, -1)  # (N,N,N,1)
 
-            R = f_ext_gpu + f_int_gpu - mass_expanded * a_new_expanded
-            # Zero out residual at low-mass nodes (not in free set F)
+            # Mass-normalized residual: R = (f_ext + f_int)/m - a^{n+1}
+            # = g + f_int/m - a  (acceleration units, O(1) magnitude)
+            # This avoids O(m/dt^2) scaling that causes overflow at large k
+            safe_mass = cp.maximum(mass_expanded, mass_thresh)
+            R = (f_ext_gpu + f_int_gpu) / safe_mass - a_new_expanded
+            # Zero out at low-mass nodes
             low_mass = mass_local < mass_thresh
             R[low_mass] = 0.0
 
@@ -701,9 +705,14 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             res_norm = float(cp.sqrt(cp.sum(R_k ** 2)))
 
             if step == 0:
-                print(f"  [Newton {newton_it}] res={res_norm:.3e} eta={eta_k:.2e}", flush=True)
+                _rel = res_norm / res_0 if newton_it > 0 else 1.0
+                print(f"  [Newton {newton_it}] res={res_norm:.3e} rel={_rel:.3e} eta={eta_k:.2e}", flush=True)
 
-            if res_norm < self.implicit_tolerance:
+            # Relative convergence: ||R_k|| / ||R_0|| < tol
+            if newton_it == 0:
+                res_0 = max(res_norm, 1e-14)
+            rel_res = res_norm / res_0
+            if rel_res < self.implicit_tolerance or res_norm < 1e-10:
                 converged = True
                 final_residual = res_norm
                 break
@@ -748,9 +757,9 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             A = CpLinearOperator((n, n), matvec=matvec, dtype=cp.float64)
 
             # Preconditioner (Eq.20): W_I = m_I / (β·Δt²)
-            _mass_flat = cp.maximum(mass_gpu.ravel(), mass_thresh)
-            _mass_rep = cp.repeat(_mass_flat, 3)
-            _diag_w = _mass_rep / (beta_nm * dt * dt)
+            # Preconditioner for mass-normalized residual: W = 1/(β·dt²)
+            # (mass cancels since R is in acceleration units)
+            _diag_w = cp.ones(n, dtype=cp.float64) / (beta_nm * dt * dt)
             _diag_w = cp.maximum(_diag_w, 1e-8)
             M_prec = CpLinearOperator((n, n), matvec=lambda x: x / _diag_w, dtype=cp.float64)
 
