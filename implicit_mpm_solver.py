@@ -54,7 +54,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
         # Solver parameters
         self.implicit_max_iters = 30          # Picard iterations per step
-        self.implicit_tolerance = 1e-3        # L2 convergence threshold (momentum residual)
+        self.implicit_tolerance = 5.0         # L2 convergence threshold (momentum/force units)
         self.implicit_relaxation = 0.7        # Under-relaxation factor (1.0 = no relaxation)
         self.newton_max_iters = 25            # Newton outer iterations (adaptive: 3-25)
         self.gmres_max_iters = 15            # GMRES Krylov vectors per cycle (paper Eq.19)
@@ -493,19 +493,99 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
             gv_new = self.mpm_state.grid_v_out.numpy()
         return np.clip(gv_new, -v_max, v_max)
 
-    def p2g2p_newton_gmres(self, step: int, dt: float) -> dict:
+    def _p2g_momentum_only(self, dt):
+        """P2G without stress — returns pure APIC momentum on grid.
+        Temporarily zeros out particle_stress, runs P2G, then restores."""
+        device = self.device
+        grid_size = (self.mpm_model.grid_dim_x,
+                     self.mpm_model.grid_dim_y,
+                     self.mpm_model.grid_dim_z)
+        # Save stress, zero it
+        stress_buf = wp.empty_like(self.mpm_state.particle_stress)
+        wp.copy(stress_buf, self.mpm_state.particle_stress)
+        wp.launch(kernel=zero_stress, dim=self.n_particles,
+                  inputs=[self.mpm_state.particle_stress,
+                          self.mpm_state.particle_selection], device=device)
+        # P2G with zero stress → pure momentum
+        wp.launch(kernel=mpm.zero_grid, dim=grid_size,
+                  inputs=[self.mpm_state, self.mpm_model], device=device)
+        wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+        momentum = self.mpm_state.grid_v_in.numpy().copy()
+        mass = self.mpm_state.grid_m.numpy().copy()
+        # Restore stress
+        wp.copy(self.mpm_state.particle_stress, stress_buf)
+        return momentum, mass
+
+    def _eval_forces(self, v_grid, dt):
         """
-        Implicit MPM via displacement-based Newton-GMRES (paper-faithful).
-        GPU-accelerated with CuPy for GMRES and all vector operations.
+        Given grid velocity v^{n+1}, update particles and do P2G.
+        Returns (f_int, f_ext, mass) on the grid.
 
-        Solves for grid displacement increment du_I:
-          R_I(du) = v_explicit_I(du) - v_newmark_I(du) = 0
-
-        Newmark-beta time integration (beta=1/4, gamma=1/2).
+        f_ext_I = m_I * g
+        f_int_I = (grid_v_in_full - grid_v_in_momentum) / dt
         """
         import cupy as cp
-        from cupyx.scipy.sparse.linalg import gmres as cp_gmres, LinearOperator as CpLinearOperator
-        from scipy.sparse.linalg import LinearOperator as SpLinearOperator
+        device = self.device
+        grid_size = (self.mpm_model.grid_dim_x,
+                     self.mpm_model.grid_dim_y,
+                     self.mpm_model.grid_dim_z)
+        v_max = min(50.0, 0.4 * self.mpm_model.grid_lim / dt)
+
+        # Convert to numpy for Warp
+        if hasattr(v_grid, 'get'):  # cupy
+            v_np = cp.asnumpy(cp.clip(v_grid, -v_max, v_max).astype(cp.float32))
+        else:
+            v_np = np.clip(v_grid, -v_max, v_max).astype(np.float32)
+
+        # Restore to (x^n, v^n, C^n, F^n), then update x and F using v^{n+1}
+        self._restore_state()
+        self._update_x_F(v_np, dt, apply_bc=True)
+        # Updated Lagrangian: particles now at x^{n+1} = x^n + dt*v^{n+1}
+
+        # Clamp F_trial to prevent stress explosion
+        wp.launch(kernel=clamp_F_trial_J, dim=self.n_particles,
+                  inputs=[self.mpm_state.particle_F_trial,
+                          self.mpm_state.particle_selection, 0.1, 10.0], device=device)
+
+        # Compute stress from updated F
+        wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+
+        # Pass 1: P2G momentum only (zero stress)
+        momentum, mass = self._p2g_momentum_only(dt)
+
+        # Pass 2: P2G with stress (full)
+        wp.launch(kernel=mpm.zero_grid, dim=grid_size,
+                  inputs=[self.mpm_state, self.mpm_model], device=device)
+        wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
+                  inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+        grid_v_in_full = self.mpm_state.grid_v_in.numpy().copy()
+
+        # Extract internal force: grid_v_in = momentum + dt * f_int
+        # So f_int = (grid_v_in_full - momentum) / dt
+        f_int = (grid_v_in_full - momentum) / dt
+
+        # External force: f_ext_I = m_I * g
+        g = self.mpm_model.gravitational_accelaration
+        f_ext = np.zeros_like(f_int)
+        for d in range(3):
+            f_ext[..., d] = mass * g[d]
+
+        return f_int, f_ext, mass
+
+    def p2g2p_newton_gmres(self, step: int, dt: float) -> dict:
+        """
+        Implicit MPM via Newton-GMRES with proper momentum residual.
+        Paper-faithful (arXiv 2602.17117, Eq.8-16).
+
+        Residual: R_I(Δu) = f_I^ext + f_I^int(Δu) - m_I · a_I^{n+1}(Δu)
+
+        Newmark-β: β=1/4, γ=1/2 (trapezoidal rule).
+        """
+        import cupy as cp
+        from cupyx.scipy.sparse.linalg import gmres as cp_gmres
+        from cupyx.scipy.sparse.linalg import LinearOperator as CpLinearOperator
 
         device = self.device
         grid_size = (self.mpm_model.grid_dim_x,
@@ -525,95 +605,81 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         # ---- Step 2: Save state ----
         self._save_state()
 
-        # ---- Step 3: Newmark parameters ----
+        # ---- Step 3: Setup ----
         beta_nm  = 0.25
         gamma_nm = 0.5
         v_max = min(50.0, 0.4 * self.mpm_model.grid_lim / dt)
 
-        # Get v^n from explicit P2G
+        # Get v^n and mass from explicit P2G (at x^n, F^n)
         wp.launch(kernel=mpm.zero_grid, dim=grid_size,
                   inputs=[self.mpm_state, self.mpm_model], device=device)
         wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
                   inputs=[self.mpm_state, self.mpm_model, dt], device=device)
         wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
                   inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+        v_grid_n = self._grid_velocity_from_p2g(dt)  # v^n on grid
 
-        v_grid_n_np = self._grid_velocity_from_p2g(dt)
-        v_grid_n = cp.asarray(v_grid_n_np, dtype=cp.float64)
+        grid_mass_np = self.mpm_state.grid_m.numpy()
+        mass_max = float(grid_mass_np.max()) if grid_mass_np.max() > 0 else 1.0
+        mass_thresh = max(1e-10, 1e-2 * mass_max)
 
-        # Grid mass on GPU
-        grid_mass_np = self.mpm_state.grid_m.numpy().ravel()
-        grid_mass = cp.asarray(grid_mass_np, dtype=cp.float64)
-        mass_thresh = max(1e-10, 1e-2 * float(grid_mass.max())) if float(grid_mass.max()) > 0 else 1e-10
-
-        # Previous acceleration
+        # Previous acceleration for Newmark predictor
         if hasattr(self, '_prev_grid_a') and self._prev_grid_a is not None:
-            a_n = cp.asarray(self._prev_grid_a, dtype=cp.float64)
+            a_n = self._prev_grid_a
         else:
-            a_n = cp.zeros_like(v_grid_n)
+            a_n = np.zeros_like(v_grid_n)
 
-        # ---- Step 4: Initial guess (Newmark predictor, Eq.14) ----
-        du_k = dt * v_grid_n + 0.5 * dt * dt * a_n
+        # ---- Step 4: Initial guess (Eq.14) ----
+        # Δu^(0) = Δt·v^n + ½·Δt²·a^n
+        du_k = cp.asarray(dt * v_grid_n + 0.5 * dt * dt * a_n, dtype=cp.float64)
 
-        # Apply BCs
+        # BCs on initial guess
         if len(self.grid_postprocess) > 0:
-            v_from_du = cp.asnumpy((du_k / dt).astype(cp.float32))
-            self._write_grid_v(v_from_du)
+            v_tmp = cp.asnumpy((du_k / dt).astype(cp.float32))
+            self._write_grid_v(v_tmp)
             for k_bc in range(len(self.grid_postprocess)):
                 wp.launch(kernel=self.grid_postprocess[k_bc], dim=grid_size,
                           inputs=[self.time, dt, self.mpm_state, self.mpm_model,
                                   self.collider_params[k_bc]], device=device)
-            v_bc = self.mpm_state.grid_v_out.numpy()
-            du_k = cp.asarray(v_bc, dtype=cp.float64) * dt
-
+            du_k = cp.asarray(self.mpm_state.grid_v_out.numpy(), dtype=cp.float64) * dt
         du_k = cp.clip(du_k, -v_max * dt, v_max * dt)
 
-        # ---- Helper: evaluate residual R(du) → returns CuPy array ----
+        # Move constants to GPU
+        v_n_gpu = cp.asarray(v_grid_n, dtype=cp.float64)
+        a_n_gpu = cp.asarray(a_n, dtype=cp.float64)
+        mass_gpu = cp.asarray(grid_mass_np, dtype=cp.float64)
+
+        # ---- Helper: momentum residual R(Δu) ----
         def eval_residual(du_cp):
-            """R = v_explicit - v_newmark. All on GPU except Warp kernel calls."""
-            # Newmark relations (GPU)
-            a_new = (du_cp - dt * v_grid_n - dt * dt * (0.5 - beta_nm) * a_n) / (beta_nm * dt * dt)
-            v_new = v_grid_n + dt * ((1.0 - gamma_nm) * a_n + gamma_nm * a_new)
-            v_new = cp.clip(v_new, -v_max, v_max)
+            """
+            R_I = f_I^ext + f_I^int(Δu) - m_I · a_I^{n+1}(Δu)
 
-            # Transfer to numpy for Warp kernels
-            v_new_np = cp.asnumpy(v_new.astype(cp.float32))
+            1. Newmark: a^{n+1}, v^{n+1} from Δu
+            2. _eval_forces: update particles, two-pass P2G, extract f_int
+            3. R = f_ext + f_int - m*a
+            """
+            # Newmark relations (Eq.8-9) on GPU
+            a_new = (du_cp - dt * v_n_gpu - dt*dt*(0.5 - beta_nm) * a_n_gpu) / (beta_nm * dt * dt)
+            v_new = v_n_gpu + dt * ((1.0 - gamma_nm) * a_n_gpu + gamma_nm * a_new)
 
-            # Restore state, update x and F
-            self._restore_state()
-            self._update_x_F(v_new_np, dt, apply_bc=True)
+            # Get forces from two-pass P2G (on CPU/Warp)
+            v_new_np = cp.asnumpy(cp.clip(v_new, -v_max, v_max).astype(cp.float32))
+            f_int_np, f_ext_np, mass_np = self._eval_forces(v_new_np, dt)
 
-            # Clamp F_trial
-            wp.launch(kernel=clamp_F_trial_J, dim=self.n_particles,
-                      inputs=[self.mpm_state.particle_F_trial,
-                              self.mpm_state.particle_selection, 0.1, 10.0], device=device)
+            # Momentum residual: R = f_ext + f_int - m * a^{n+1}
+            f_int_gpu = cp.asarray(f_int_np, dtype=cp.float64)
+            f_ext_gpu = cp.asarray(f_ext_np, dtype=cp.float64)
+            mass_local = cp.asarray(mass_np, dtype=cp.float64)
 
-            # Compute stress and P2G
-            wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
-                      inputs=[self.mpm_state, self.mpm_model, dt], device=device)
-            wp.launch(kernel=mpm.zero_grid, dim=grid_size,
-                      inputs=[self.mpm_state, self.mpm_model], device=device)
-            wp.launch(kernel=mpm.p2g_apic_with_stress, dim=self.n_particles,
-                      inputs=[self.mpm_state, self.mpm_model, dt], device=device)
+            # Expand mass to match force shape (..., 3)
+            a_new_expanded = a_new  # already (N,N,N,3)
+            mass_expanded = cp.expand_dims(mass_local, -1)  # (N,N,N,1)
 
-            # Get explicit velocity
-            v_explicit_np = self._grid_velocity_from_p2g(dt)
+            R = f_ext_gpu + f_int_gpu - mass_expanded * a_new_expanded
+            # Zero out residual at low-mass nodes (not in free set F)
+            low_mass = mass_local < mass_thresh
+            R[low_mass] = 0.0
 
-            # Apply BCs
-            if len(self.grid_postprocess) > 0:
-                self._write_grid_v(v_explicit_np)
-                for k_bc in range(len(self.grid_postprocess)):
-                    wp.launch(kernel=self.grid_postprocess[k_bc], dim=grid_size,
-                              inputs=[self.time, dt, self.mpm_state, self.mpm_model,
-                                      self.collider_params[k_bc]], device=device)
-                v_explicit_np = self.mpm_state.grid_v_out.numpy()
-
-            v_explicit_np = np.clip(v_explicit_np, -v_max, v_max)
-
-            # Back to GPU
-            v_explicit = cp.asarray(v_explicit_np, dtype=cp.float64)
-
-            R = v_explicit - v_new.astype(cp.float64)
             return R, v_new, a_new
 
         # ---- Step 5: Newton outer loop ----
@@ -622,11 +688,8 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         total_evals = 0
         final_residual = float('inf')
 
-        # Eisenstat-Walker
         EW_eta_max = 0.9
         EW_eta_min = 1e-4
-        EW_gamma   = 0.9
-        EW_alpha   = 1.5
         min_newton_iters = 5
         prev_res_norm = None
         prev_prev_res_norm = None
@@ -651,26 +714,26 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
                     contraction = res_norm / prev_res_norm
                     if contraction > 0.995:
                         if step == 0:
-                            print(f"  [Newton] stagnation at iter {newton_it}, c={contraction:.3f}", flush=True)
+                            print(f"  [Newton] stagnation iter {newton_it}, c={contraction:.3f}", flush=True)
                         break
             final_residual = res_norm
 
             # Eisenstat-Walker
             if prev_res_norm is not None and prev_prev_res_norm is not None and prev_prev_res_norm > 1e-14:
                 eta_ew = abs(res_norm - prev_res_norm) / prev_prev_res_norm
-                eta_sg = EW_gamma * (res_norm / prev_res_norm) ** EW_alpha if prev_res_norm > 1e-14 else EW_eta_max
+                eta_sg = 0.9 * (res_norm / prev_res_norm) ** 1.5 if prev_res_norm > 1e-14 else EW_eta_max
                 eta_k = min(EW_eta_max, max(EW_eta_min, max(eta_ew, eta_sg)))
             elif prev_res_norm is not None:
                 eta_k = EW_eta_max
             prev_prev_res_norm = prev_res_norm
             prev_res_norm = res_norm
 
-            # ---- GMRES on GPU ----
+            # ---- GMRES: J·δu = -R (Eq.15-16) ----
             R_k_flat = R_k.ravel()
 
             def matvec(p_flat, _du_k=du_k):
                 nonlocal total_evals
-                # Central FD JVP on GPU
+                # Central FD JVP (Eq.19): J·p ≈ [R(Δu+εp) - R(Δu-εp)] / (2ε)
                 norm_inf = float(cp.max(cp.abs(p_flat)))
                 if norm_inf < 1e-14:
                     return p_flat.copy()
@@ -684,8 +747,9 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
             A = CpLinearOperator((n, n), matvec=matvec, dtype=cp.float64)
 
-            # Preconditioner on GPU
-            _mass_rep = cp.repeat(cp.maximum(grid_mass, mass_thresh), 3)
+            # Preconditioner (Eq.20): W_I = m_I / (β·Δt²)
+            _mass_flat = cp.maximum(mass_gpu.ravel(), mass_thresh)
+            _mass_rep = cp.repeat(_mass_flat, 3)
             _diag_w = _mass_rep / (beta_nm * dt * dt)
             _diag_w = cp.maximum(_diag_w, 1e-8)
             M_prec = CpLinearOperator((n, n), matvec=lambda x: x / _diag_w, dtype=cp.float64)
@@ -695,11 +759,12 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
                                         maxiter=3, atol=0, rtol=float(eta_k))
             delta_du = delta_flat.reshape(du_k.shape)
 
-            # ---- Armijo line search ----
+            # ---- Armijo line search (Eq.17) ----
             phi_0 = 0.5 * float(cp.sum(R_k_flat ** 2))
             dphi_0 = -2.0 * phi_0
 
             if dphi_0 >= 0:
+                # Steepest descent fallback (paper specifies this)
                 delta_du = -R_k
                 dphi_0 = -2.0 * phi_0
 
@@ -716,26 +781,23 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
 
             du_k = cp.clip(du_k + alpha * delta_du, -v_max * dt, v_max * dt)
 
-        # ---- Step 6: Final state update ----
-        a_final = (du_k - dt * v_grid_n - dt * dt * (0.5 - beta_nm) * a_n) / (beta_nm * dt * dt)
-        v_final = v_grid_n + dt * ((1.0 - gamma_nm) * a_n + gamma_nm * a_final)
+        # ---- Step 6: Final state ----
+        a_final = (du_k - dt * v_n_gpu - dt*dt*(0.5 - beta_nm) * a_n_gpu) / (beta_nm * dt * dt)
+        v_final = v_n_gpu + dt * ((1.0 - gamma_nm) * a_n_gpu + gamma_nm * a_final)
         v_final = cp.clip(v_final, -v_max, v_max)
+        v_final_np = cp.asnumpy(v_final.astype(cp.float32))
 
-        # Store for next step
+        # Store a^{n+1} for next step's Newmark predictor
         self._prev_grid_a = cp.asnumpy(a_final)
         self._prev_particle_v = self.mpm_state.particle_v.numpy().copy()
         self._prev_dt = dt
 
-        v_final_np = cp.asnumpy(v_final.astype(cp.float32))
-
-        # Restore and final G2P
+        # Restore and final G2P with converged velocity
         self._restore_state()
         wp.launch(kernel=mpm.compute_stress_from_F_trial, dim=self.n_particles,
                   inputs=[self.mpm_state, self.mpm_model, dt], device=device)
-
         if self.mpm_model.grid_v_damping_scale < 1.0:
             v_final_np = v_final_np * self.mpm_model.grid_v_damping_scale
-
         self._write_grid_v(v_final_np)
         for k_bc in range(len(self.grid_postprocess)):
             wp.launch(kernel=self.grid_postprocess[k_bc], dim=grid_size,
@@ -743,7 +805,6 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
                               self.collider_params[k_bc]], device=device)
             if self.modify_bc[k_bc] is not None:
                 self.modify_bc[k_bc](self.time, dt, self.collider_params[k_bc])
-
         wp.launch(kernel=mpm.g2p, dim=self.n_particles,
                   inputs=[self.mpm_state, self.mpm_model, dt], device=device)
         wp.launch(kernel=clamp_particle_positions, dim=self.n_particles,
@@ -761,7 +822,7 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         max_v = float(np.max(np.abs(particle_v_np)))
         gv_max = float(np.max(np.abs(v_final_np))) if np.all(np.isfinite(v_final_np)) else float('inf')
         print(f"[Newton-GMRES] step={step} newton={newton_it+1} converged={converged} "
-              f"res={final_residual:.3e} evals={total_evals} eta={eta_k:.2e} "
+              f"res={final_residual:.3e} evals={total_evals} "
               f"gv_max={gv_max:.2f} max_v={max_v:.3f}",
               flush=True)
         return {'converged': converged, 'iterations': newton_it + 1,
@@ -867,6 +928,18 @@ class ImplicitMPMSolver(MPM_Simulator_WARP):
         wp.copy(self.mpm_state.grid_v_out, self._grid_v_buf)
         wp.synchronize_device(self.device)
 
+
+
+
+@wp.kernel
+def zero_stress(
+    particle_stress: wp.array(dtype=wp.mat33),
+    particle_selection: wp.array(dtype=int),
+):
+    """Zero out particle stress for momentum-only P2G."""
+    p = wp.tid()
+    if particle_selection[p] == 0:
+        particle_stress[p] = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 # ==========================================================================
 # Kernel: clamp particle positions to valid grid stencil after G2P
