@@ -92,8 +92,10 @@ def run_eval(base_dir, scene="ficus", n_frames=126):
     K_VALUES = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 
     methods = {
-        "i-PhysGaussian": ("newton_gmres", f"{scene}_newton_k{{k}}_ply"),
-        "PhysGaussian":   ("picard",       f"{scene}_picard_k{{k}}_ply"),
+        "i-PhysGaussian (v4)":   ("newton_gmres",  f"{scene}_newton_v4_k{{k}}_ply"),
+        "PhysGaussian (vanilla)": ("picard_vanilla", f"{scene}_picard_vanilla_k{{k}}_ply"),
+        "PhysGaussian (30-iter)": ("picard",         f"{scene}_picard_k{{k}}_ply"),
+        "i-PhysGaussian (old)":  ("newton_gmres",   f"{scene}_newton_k{{k}}_ply"),
     }
 
     # ── Per-method, per-k results ───────────────────────────────────────────
